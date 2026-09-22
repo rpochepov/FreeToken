@@ -424,10 +424,33 @@ def iter_ftw_weights(path: str, *, kinds=("weight",), workers: int = 8,
 def load_ftw_banks(
     path: str, *, num_layers: int, workers: int = 8, chunk: int = _DEFAULT_CHUNK,
     layer_residency: list[str] | None = None,
+    owner_slice: tuple[int, int] | None = None,
 ):
     """Reconstruct the offload :class:`ExpertBanks` from the FTW's ``experts_bank``
     entries, on the per-layer host bank contract (one ``[num_experts, ...]``
     HostBank per layer per bank; see ``moe.offload_cache.set_bank_sources``).
+
+    ``owner_slice=(start, count)`` loads only that contiguous range of expert rows
+    from every per-layer bank, producing ``[count, ...]`` banks -- what owner-local
+    expert parallelism (``--moe-ep-size > 1``) needs, where rank r owns experts
+    ``[r*count, (r+1)*count)`` of the global 512. Without it the banks come back
+    ``[num_experts, ...]`` GLOBAL, which cannot bind to owner-local geometry (that
+    mismatch is why owner EP used to reject FTW checkpoints outright and rebuild
+    banks from raw safetensors on every boot, ~32 min for this model).
+
+    Slicing reuses the flat layout's aligned-window carve, so it works whether or
+    not a bank's row size is a multiple of ALIGN: the read covers
+    ``[align_down(off), align_up(off+len))`` and the owner rows are viewed out of
+    it at ``head_pad``. For this model 4 of 6 banks (99.72% of the bytes:
+    gate_up/down ``_packed`` and ``_scale``) have row sizes that are exact
+    multiples of 4096, so ``head_pad`` is 0 and the window is the exact range; the
+    two fp16 ``*_global`` banks are not aligned and fall back to a padded window,
+    costing 180 MiB of over-read per rank across 48 layers.
+
+    Only the per-layer layout is sliceable. The flat layout interleaves all layers
+    in one ``[num_layers*num_experts, ...]`` region, so one owner's rows are NOT
+    contiguous there, and alphas are flat ``[num_layers*num_experts]`` vectors --
+    both are rejected rather than silently mis-sliced.
 
     ``layer_residency`` (default: all pinned) settles each layer's banks per its ``HostResidency`` label as reads complete: PINNED -> cudaHostRegister, LOCKED -> mlock (CPU-executor resident, no pin quota spent).
     The applied labels are echoed back on ``ExpertBanks.layer_residency``.
@@ -505,6 +528,38 @@ def load_ftw_banks(
     mixed = {e["name"] for e in flat_entries} & per_layer_groups.keys()
     assert not mixed, f"FTW bank(s) mix flat and per-layer row layouts: {sorted(mixed)}"
 
+    if owner_slice is not None:
+        o_start, o_count = owner_slice
+        if o_count <= 0 or o_start < 0:
+            raise ValueError(f"owner_slice must be a positive (start, count), got {owner_slice}")
+        if flat_entries:
+            raise ValueError(
+                "owner_slice needs the per-layer FTW bank layout: the flat layout packs all "
+                f"layers into one [num_layers*num_experts, ...] region, so one owner's expert "
+                f"rows are not contiguous. Offending banks: {sorted(e['name'] for e in flat_entries)}. "
+                "Reconvert with a streamable expert format (moe_backend=offload)."
+            )
+        if alpha_entries:
+            raise ValueError(
+                "owner_slice cannot filter alpha vectors: they are flat "
+                f"[num_layers*num_experts] with no per-layer row split. Offending: "
+                f"{sorted(e['name'] for e in alpha_entries)}. Triton-packed NVFP4 banks have no "
+                "alphas (those are marlin's gate_up_alpha/down_alpha), so this means the "
+                "checkpoint was converted for a different --quant-backend than the server is using."
+            )
+        for base, by_layer in per_layer_groups.items():
+            n = by_layer[0]["shape"][0]
+            if o_start + o_count > n:
+                raise ValueError(
+                    f"owner_slice ({o_start}, {o_count}) exceeds bank {base!r}, which has "
+                    f"{n} expert rows per layer"
+                )
+            if n % o_count:
+                raise ValueError(
+                    f"bank {base!r} has {n} experts per layer, not evenly divisible by the "
+                    f"owner count {o_count}; owner-local geometry would not cover every expert"
+                )
+
     # Row banks: one padded-window HostBank per (name, layer_id) for the flat layout, plus
     # how to carve the real [num_experts, *row_shape] tensor out of its head; ``None`` marks
     # a per-layer entry (direct view, no carving needed).
@@ -544,12 +599,35 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            if owner_slice is None:
+                bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+                row_hb[base].append(bank)
+                row_view_args[base].append(None)
+                layer_jobs.append((base, bank, e, layer_id))
+                continue
+            # Owner-local slice. The entry start is ALIGN-aligned by the writer, but
+            # start*row_bytes usually is not, so read the ALIGNED ENCLOSING WINDOW and
+            # carve the owner rows out at head_pad -- the same mechanism the flat layout
+            # uses. When row_bytes % ALIGN == 0 (true for 4 of this model's 6 banks) the
+            # window is exactly the owner range and head_pad is 0, so nothing is over-read.
+            dtype = _dtype_of(e["dtype"])
+            row_shape = tuple(e["shape"][1:])
+            row_bytes = (math.prod(row_shape) if row_shape else 1) * _elsize(dtype)
+            off = e["global_off"] + o_start * row_bytes
+            want = o_count * row_bytes
+            win_off = (off // ALIGN) * ALIGN
+            win_end = _align_up(off + want)
+            bank = HostBank((win_end - win_off,), torch.uint8, backing=_backing(layer_id))
             row_hb[base].append(bank)
-            row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e, layer_id))
+            row_view_args[base].append((off - win_off, want, o_count, row_shape, dtype))
+            row_jobs.append((base, bank, win_off, win_end - win_off, want, layer_id))
 
-    total_bytes = sum(e["nbytes"] for e in bank_entries)
+    # The bar tracks bytes actually read, which under owner_slice is the owner's windows
+    # rather than every entry in the file.
+    if owner_slice is None:
+        total_bytes = sum(e["nbytes"] for e in bank_entries)
+    else:
+        total_bytes = sum(job[3] for job in row_jobs)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins

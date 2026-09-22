@@ -64,10 +64,18 @@ def test_cpu_layers_are_rejected_instead_of_silently_ignored(layers):
         _validate_owner_ep_config(_config(moe_cpu_layers=layers))
 
 
-def test_ftw_checkpoints_are_rejected(monkeypatch):
+def test_ftw_checkpoints_are_accepted(monkeypatch):
+    """FTW used to be rejected here because load_ftw_banks rebuilt GLOBAL expert rows.
+
+    It now takes owner_slice and carves each rank's rows out of the per-layer bank
+    entries, so an FTW is not only allowed but the fast path: ~1.6 s per rank versus
+    ~32 min rebuilding banks from raw safetensors for Qwen3.8-Flash-Next at 4 ranks.
+    The layouts that genuinely cannot be sliced per owner (the flat
+    [num_layers*num_experts, ...] row layout, and alpha vectors) are rejected inside
+    load_ftw_banks instead, where the entry layout is known.
+    """
     monkeypatch.setattr("freetoken.checkpoint.ftw.is_ftw_checkpoint", lambda path: True)
-    with pytest.raises(ValueError, match="FTW"):
-        _validate_owner_ep_config(_config())
+    _validate_owner_ep_config(_config())
 
 
 def test_an_explicit_cache_size_is_still_required_without_auto():

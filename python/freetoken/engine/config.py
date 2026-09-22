@@ -25,6 +25,20 @@ class EngineConfig:
     # values >1 require an explicit TP+EP runtime implementation and fail fast unless the
     # model/quantizer supports the owner-local bank path.
     moe_ep_size: int = 1
+    # Optional separate source for the routed-expert host banks. None means model_path.
+    #
+    # Why this exists: an FTW stores its DENSE weights post-fusion (qkv_proj,
+    # gate_up_proj, ...), but the family sharder (shard_qwen4_exp_dense_tensor) works on
+    # RAW unfused tensors so fused buffers keep head boundaries -- so a global-dense FTW
+    # cannot be TP-sharded at load without re-deriving every fusion's segment layout,
+    # which is exactly the kind of change that yields fluent-but-wrong output. And
+    # `ft checkpoint` has no TP flag, so every existing FTW has global dense weights.
+    #
+    # Pointing model_path at the HF safetensors dir (whose reader DOES shard raw tensors,
+    # and loads 206 shards in ~2 s) and this at the FTW (whose banks load ~1.6 s per rank
+    # via owner_slice, vs ~32 min to rebuild them) gets both fast paths with no new
+    # numerics: dense sharding and expert slicing each reuse an already-verified route.
+    expert_bank_path: str | None = None
     max_running_req: int = 4
     attention_backend: str = "auto"
     moe_strategy: str = "auto"

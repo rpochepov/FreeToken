@@ -327,21 +327,29 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        # Owner-local EP used to be rejected here because load_ftw_banks rebuilt
+        # [num_experts, ...] GLOBAL rows with no ownership filter, so the banks could not
+        # bind to the owner-local geometry. It now takes owner_slice and reads only this
+        # rank's expert rows (an aligned-window carve of each per-layer bank entry), which
+        # is what makes an FTW checkpoint usable with --moe-ep-size > 1 at all: the
+        # alternative is rebuilding 63 GiB of banks from raw safetensors on every boot
+        # (~32 min for Qwen3.8-Flash-Next at 4 ranks, vs ~1 s from FTW).
+        owner_slice = None
         if ownership is not None:
-            # ``load_ftw_banks`` rebuilds ``[num_experts, ...]`` GLOBAL rows and has no
-            # ownership filter, so the banks could not bind to the owner-local geometry.
-            # The engine rejects this combination up front; guard the loader too so a
-            # converter/tool call cannot reach the same inconsistent state.
-            raise NotImplementedError(
-                "owner-local expert banks are not supported for FTW checkpoints: the FTW "
-                "bank loader rebuilds global expert rows and does not filter by ownership"
-            )
+            owner_slice = (ownership.global_start, ownership.local_num_experts)
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
-            layer_residency=layer_residency,
+            layer_residency=layer_residency, owner_slice=owner_slice,
         )
         if banks is not None:
-            logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            if owner_slice is None:
+                logger.info_rank0(f"expert banks: FTW fast path (FTW checkpoint {model_path})")
+            else:
+                logger.info_rank0(
+                    f"expert banks: FTW fast path, owner-local rows "
+                    f"[{owner_slice[0]}, {owner_slice[0] + owner_slice[1]}) of "
+                    f"{model_config.num_experts} (FTW checkpoint {model_path})"
+                )
             return banks
 
     if parallel and not _PARALLEL_READER_SUPPORTED:

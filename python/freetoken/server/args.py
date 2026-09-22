@@ -249,6 +249,20 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--expert-bank-path",
+        type=str,
+        default=None,
+        help="Optional separate checkpoint to read the routed-expert host banks from; "
+             "defaults to --model-path. Set this to an FTW dir while --model-path points "
+             "at the HF safetensors dir to get both fast paths under owner-local EP "
+             "(--moe-ep-size > 1): dense weights shard from raw safetensors, experts load "
+             "pre-packed from the FTW instead of being rebuilt (~32 min -> ~2 s for "
+             "Qwen3.8-Flash-Next). An FTW's dense weights are stored post-fusion and "
+             "global, so they cannot be TP-sharded at load; its banks can be sliced per "
+             "owner. The two checkpoints must be the same model at the same quant backend.",
+    )
+
+    parser.add_argument(
         "--dtype",
         type=str,
         default="auto",

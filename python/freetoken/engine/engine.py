@@ -92,14 +92,14 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
             "the GPU slot cache and _decode_owner is selected before the is_cpu_layer "
             "branch, so --moe-cpu-layers would be accepted and then silently ignored"
         )
-    from freetoken.checkpoint.ftw import is_ftw_checkpoint
-
-    if is_ftw_checkpoint(config.model_path):
-        raise ValueError(
-            "owner EP is not supported for FTW checkpoints: load_ftw_banks rebuilds "
-            "[num_experts, ...] GLOBAL expert rows with no ownership filter, so the banks "
-            "cannot bind to the owner-local geometry"
-        )
+    # FTW checkpoints ARE supported under owner EP: load_ftw_banks takes owner_slice and
+    # reads only this rank's expert rows (an aligned-window carve of each per-layer bank
+    # entry), so the banks bind to the owner-local geometry. This used to raise, which
+    # forced a full bank rebuild from raw safetensors on every boot. The loader still
+    # rejects the two layouts that genuinely cannot be sliced per owner -- the flat
+    # [num_layers*num_experts, ...] row layout (one owner's rows are not contiguous
+    # there) and alpha vectors -- so an incompatible checkpoint fails loudly at load
+    # rather than binding a wrong-shaped bank.
     # CUDA graphs are allowed: decode admission goes through the fixed-shape, sync-free
     # OwnerOffloadMoeCache.ensure_route_graph when graphs are on (see _owner_graph_safe).
 
@@ -682,7 +682,10 @@ class Engine:
             ]
         try:
             banks = load_expert_banks(
-                config.model_path,
+                # --expert-bank-path lets the banks come from a pre-packed FTW while the
+                # dense weights are read (and TP-sharded) from the raw checkpoint. See
+                # EngineConfig.expert_bank_path for why an FTW cannot serve both under TP.
+                config.expert_bank_path or config.model_path,
                 config.model_config,
                 method=method,
                 device=self.device,
