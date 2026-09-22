@@ -85,6 +85,20 @@ def test_a_non_offload_strategy_is_still_rejected():
         _validate_owner_ep_config(_config(moe_strategy="resident"))
 
 
-def test_a_topology_other_than_tp2_ep2_is_still_rejected():
-    with pytest.raises(ValueError, match="TP2"):
-        _validate_owner_ep_config(_config(tp_info=SimpleNamespace(size=4, rank=0)))
+def test_wider_same_group_topologies_pass():
+    """tp4-owner-ep: the owner path is written against ``world_size``, not a rank
+    count of 2, so any same-group TP=N/EP=N is admissible here. Whether N actually
+    divides the expert count is ``ExpertOwnership``'s job (it validates
+    ``global_num_experts % world_size``), not this flag-level guard's."""
+    for n in (2, 4, 8):
+        _validate_owner_ep_config(
+            _config(moe_ep_size=n, tp_info=SimpleNamespace(size=n, rank=0))
+        )
+
+
+def test_a_mismatched_ep_and_tp_is_still_rejected():
+    """The same-group invariant remains: EP must equal TP."""
+    with pytest.raises(ValueError, match="same-group"):
+        _validate_owner_ep_config(
+            _config(moe_ep_size=2, tp_info=SimpleNamespace(size=4, rank=0))
+        )

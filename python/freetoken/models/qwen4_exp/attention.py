@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Protocol
 import torch
 from freetoken.core import get_global_ctx
 from freetoken.distributed import get_tp_info
-from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearReplicated
+from freetoken.layers import BaseOP, GemmaPlusOneRMSNorm, LinearColParallelMerged, LinearOProj, LinearQKVMerged, LinearReplicated
 from freetoken.models.qwen4_exp.config import qwen4_exp_tp_geometry
 from freetoken.layers.rotary import get_rope
 from freetoken.utils import nvtx_annotate
@@ -147,8 +147,27 @@ class Qwen4ExpAttention(BaseOP):
             raise NotImplementedError(
                 "qwen4_exp dense TP currently supports the BF16 attention path only"
             )
-        self.qkv_proj = LinearColParallelMerged(
-            config.hidden_size, self._qkv_global_split, has_bias=False,
+        # tp4-owner-ep: this was LinearColParallelMerged(hidden, self._qkv_global_split),
+        # which shards each segment by dividing its ROW COUNT by tp_size. That is fine for
+        # Q and fine for K/V while num_kv_heads >= tp_size, but here num_kv_heads is 2, so
+        # at TP=4 it produced K/V segments of 512/4 = 128 rows -- HALF a head -- and the
+        # rank-local qkv_proj came out (3328, 2560). The loader shards by HEAD with
+        # replication (_partition: start = rank // (world // size)), emitting one whole KV
+        # head per rank, i.e. (3584, 2560). The two only agree when num_kv_heads is a
+        # multiple of tp_size, which is why this went unnoticed at TP=2 (2 kv heads / 2
+        # ranks = 1 head each, no replication either way).
+        #
+        # LinearQKVMerged is head-aware: local_num_kv = div_even(num_kv_heads, tp,
+        # allow_replicate=True), matching the loader. Q is passed doubled because the
+        # output gate makes q_proj twice as wide (see _qkv_global_split), so
+        # num_qo_heads=2*24 -> local 12 "half-heads" of 256 = 3072 rows, and
+        # local_osize = (12 + 2*1) * 256 = 3584 == self._qkv_split summed.
+        self.qkv_proj = LinearQKVMerged(
+            config.hidden_size,
+            config.head_dim,
+            num_qo_heads=2 * config.num_qo_heads,
+            num_kv_heads=config.num_kv_heads,
+            has_bias=False,
             quant_config=config.quant, prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = LinearOProj(

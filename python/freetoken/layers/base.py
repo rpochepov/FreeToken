@@ -40,9 +40,18 @@ class BaseOP:
             if name.startswith("_"):
                 continue
             if isinstance(param, torch.Tensor):
-                item = state_dict.pop(_concat_prefix(prefix, name))
+                key = _concat_prefix(prefix, name)
+                item = state_dict.pop(key)
                 assert isinstance(item, torch.Tensor)
-                assert param.shape == item.shape and param.dtype == item.dtype
+                # tp4-owner-ep diag: a bare assert here cannot say WHICH weight
+                # mismatched, which is unusable when hunting a TP shard bug across
+                # 48 layers x dozens of projections. Name the key and both shapes.
+                if param.shape != item.shape or param.dtype != item.dtype:
+                    raise AssertionError(
+                        f"shape/dtype mismatch loading {key!r}: module expects "
+                        f"{tuple(param.shape)} {param.dtype}, loader emitted "
+                        f"{tuple(item.shape)} {item.dtype}"
+                    )
                 setattr(self, name, item)
             elif isinstance(param, BaseOP):
                 param.load_state_dict(

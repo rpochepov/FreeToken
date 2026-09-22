@@ -61,10 +61,17 @@ def _validate_owner_ep_config(config: EngineConfig) -> None:
     """Fail before model/bank allocation unless the initial owner topology is explicit."""
     if config.moe_ep_size == 1:
         return
-    if config.moe_ep_size != config.tp_info.size or config.tp_info.size != 2:
+    # tp4-owner-ep: upstream pinned this to `tp_info.size != 2`, but nothing else in the
+    # owner path is 2-specific -- moe/ownership.py is written against `world_size`
+    # (ExpertOwnership validates `global_num_experts % world_size == 0` and derives
+    # `experts_per_owner = global_num_experts // world_size`), and offload_cache.py keys
+    # off `owner_geometry` rather than a rank count. So keep the same-group invariant
+    # (EP must equal TP) and let ExpertOwnership own the divisibility check, which is the
+    # real constraint: 512 experts divides by 1/2/4/8/16 but not 3, 5, 6 or 7.
+    if config.moe_ep_size != config.tp_info.size:
         raise ValueError(
-            "owner EP currently requires the initial same-group TP2+EP2 topology "
-            "(--tensor-parallel-size 2 --moe-ep-size 2)"
+            "owner EP currently requires the same-group TP+EP topology "
+            "(--tensor-parallel-size N --moe-ep-size N)"
         )
     if config.moe_strategy != "offload":
         raise ValueError("owner EP currently requires --moe-strategy offload")
