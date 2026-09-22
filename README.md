@@ -3,9 +3,9 @@
 > **Note on this file:** this branch replaces the repository's front-page `README.md` with the
 > TP=4 writeup so it renders on the fork's landing page. FreeToken's own README is preserved
 > unmodified as [`README.upstream.md`](README.upstream.md) — read that for what FreeToken is,
-> installation, and the upstream CLI. Everything below concerns only the `tp4-owner-ep` branch.
+> installation, and the upstream CLI. Everything below concerns only this fork's `main` branch.
 
-Branch **`tp4-owner-ep`** of this fork makes one request span **four GPUs** for
+The **`main`** branch of this fork makes one request span **four GPUs** for
 `Qwen4ExpForConditionalGeneration`, with routed experts offloaded to host RAM,
 262144-token context and working tool calling — on 4× RTX 3090 (24 GiB, sm_86,
 **no NVLink**).
@@ -36,15 +36,15 @@ For scale: four *independent* TP=1 replicas behind a round-robin proxy reach
 
 ## Read this first: what this branch is based on
 
-**This branch is NOT rebased onto `main`.** It sits on
+**This branch is NOT rebased onto upstream `main`.** It sits on
 [`#447`](https://github.com/FlashML-org/FreeToken/pull/447)
 (`feat(moe): owner-local expert parallelism and tensor parallelism`) at
-**`81d034d`**, which is 18 commits behind `main`. A diff against `main` therefore
+**`81d034d`**, which is 18 commits behind upstream `main`. A diff against upstream `main` therefore
 reads as `178 files changed, 5837 insertions(+), 7628 deletions(-)` — **the
 deletions are the stale base, not removed upstream work.**
 
 It cannot simply be rebased: owner-local expert parallelism does not exist in
-`main` at all. Both commits here depend on #447's `moe/ownership.py`,
+upstream `main` at all. Both commits here depend on #447's `moe/ownership.py`,
 `--moe-ep-size`, and the owner-aware offload cache.
 
 Commits on this branch, oldest first:
@@ -60,7 +60,7 @@ Commits on this branch, oldest first:
 | `cdb616a` | cherry-pick of `f7dbab7` — load ModelOpt exports with no input_scale (#462) | Xiaoze Fan |
 
 The three cherry-picks are upstream commits re-applied because #447's base predates
-them. **Cherry-pick, do not `git merge main`** — a full merge costs 12 conflict
+them. **Cherry-pick, do not `git merge` upstream `main`** — a full merge costs 12 conflict
 hunks across `engine.py`, `scheduler.py`, `qwen4_exp/{config,weight}.py` and
 `models/weight.py` (main added `include_vision` and a `keep` filter and
 restructured the function; #447 added `tp_shard`/`tp_config`). These three applied
